@@ -205,5 +205,6 @@ export type {
   ContextMenuItem,
   ContextMenuResult,
   ImageData,
+  MenuItem,
   WebviewAPI,
 };

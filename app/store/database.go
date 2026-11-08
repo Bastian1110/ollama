@@ -10,11 +10,13 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/ollama/ollama/app/types/not"
 )
 
 // currentSchemaVersion defines the current database schema version.
 // Increment this when making schema changes that require migrations.
-const currentSchemaVersion = 19
+const currentSchemaVersion = 20
 
 // database wraps the SQLite connection.
 // SQLite handles its own locking for concurrent access:
@@ -97,11 +99,18 @@ func (db *database) init() error {
 	-- Insert default settings row if it doesn't exist
 	INSERT OR IGNORE INTO settings (id) VALUES (1);
 
+	CREATE TABLE IF NOT EXISTS folders (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS chats (
 		id TEXT PRIMARY KEY,
 		title TEXT NOT NULL DEFAULT '',
 		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		browser_state TEXT
+		browser_state TEXT,
+		folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL
 	);
 
 	CREATE TABLE IF NOT EXISTS messages (
@@ -162,6 +171,11 @@ func (db *database) init() error {
 	// Check and upgrade schema version if needed
 	if err := db.migrate(); err != nil {
 		return fmt.Errorf("migrate schema: %w", err)
+	}
+
+	// Created after migrating since older databases gain chats.folder_id in a migration
+	if _, err := db.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_chats_folder_id ON chats(folder_id)`); err != nil {
+		return fmt.Errorf("create chats folder index: %w", err)
 	}
 
 	// Clean up orphaned records created before foreign key constraints were properly enforced
@@ -291,6 +305,11 @@ func (db *database) migrate() error {
 				return fmt.Errorf("migrate v18 to v19: %w", err)
 			}
 			version = 19
+		case 19:
+			if err := db.migrateV19ToV20(); err != nil {
+				return fmt.Errorf("migrate v19 to v20: %w", err)
+			}
+			version = 20
 		default:
 			// If we have a version we don't recognize, just set it to current
 			// This might happen during development
@@ -602,6 +621,31 @@ func (db *database) migrateV18ToV19() error {
 	return err
 }
 
+// migrateV19ToV20 adds folders for grouping chats
+func (db *database) migrateV19ToV20() error {
+	_, err := db.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS folders (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("create folders table: %w", err)
+	}
+
+	_, err = db.conn.Exec(`ALTER TABLE chats ADD COLUMN folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL`)
+	if err != nil && !duplicateColumnError(err) {
+		return fmt.Errorf("add folder_id column: %w", err)
+	}
+
+	_, err = db.conn.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_chats_folder_id ON chats(folder_id);
+		UPDATE settings SET schema_version = 20;
+	`)
+	return err
+}
+
 // cleanupOrphanedData removes orphaned records that may exist due to the foreign key bug
 func (db *database) cleanupOrphanedData() error {
 	_, err := db.conn.Exec(`
@@ -646,6 +690,7 @@ func (db *database) getAllChats() ([]Chat, error) {
 			c.id, 
 			c.title, 
 			c.created_at,
+			COALESCE(c.folder_id, '') as folder_id,
 			COALESCE(first_msg.content, '') as first_user_content,
 			COALESCE(datetime(MAX(m.updated_at)), datetime(c.created_at)) as last_updated
 		FROM chats c
@@ -656,7 +701,7 @@ func (db *database) getAllChats() ([]Chat, error) {
 			GROUP BY chat_id
 		) first_msg ON c.id = first_msg.chat_id
 		LEFT JOIN messages m ON c.id = m.chat_id
-		GROUP BY c.id, c.title, c.created_at, first_msg.content
+		GROUP BY c.id, c.title, c.created_at, c.folder_id, first_msg.content
 		ORDER BY last_updated DESC
 	`
 
@@ -677,6 +722,7 @@ func (db *database) getAllChats() ([]Chat, error) {
 			&chat.ID,
 			&chat.Title,
 			&createdAt,
+			&chat.FolderID,
 			&firstUserContent,
 			&lastUpdatedStr,
 		)
@@ -712,7 +758,7 @@ func (db *database) getAllChats() ([]Chat, error) {
 
 func (db *database) getChatWithOptions(id string, loadAttachmentData bool) (*Chat, error) {
 	query := `
-		SELECT id, title, created_at, browser_state
+		SELECT id, title, created_at, browser_state, COALESCE(folder_id, '')
 		FROM chats
 		WHERE id = ?
 	`
@@ -726,6 +772,7 @@ func (db *database) getChatWithOptions(id string, loadAttachmentData bool) (*Cha
 		&chat.Title,
 		&createdAt,
 		&browserState,
+		&chat.FolderID,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -816,6 +863,79 @@ func (db *database) updateChatBrowserState(chatID string, state json.RawMessage)
 	_, err := db.conn.Exec(`UPDATE chats SET browser_state = ? WHERE id = ?`, string(state), chatID)
 	if err != nil {
 		return fmt.Errorf("update chat browser state: %w", err)
+	}
+	return nil
+}
+
+func (db *database) getFolders() ([]Folder, error) {
+	rows, err := db.conn.Query(`SELECT id, name, created_at FROM folders ORDER BY name COLLATE NOCASE, id`)
+	if err != nil {
+		return nil, fmt.Errorf("query folders: %w", err)
+	}
+	defer rows.Close()
+
+	folders := []Folder{}
+	for rows.Next() {
+		var f Folder
+		if err := rows.Scan(&f.ID, &f.Name, &f.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan folder: %w", err)
+		}
+		folders = append(folders, f)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate folders: %w", err)
+	}
+
+	return folders, nil
+}
+
+func (db *database) createFolder(f Folder) error {
+	_, err := db.conn.Exec(`INSERT INTO folders (id, name, created_at) VALUES (?, ?, ?)`, f.ID, f.Name, f.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("create folder: %w", err)
+	}
+	return nil
+}
+
+func (db *database) renameFolder(id, name string) error {
+	res, err := db.conn.Exec(`UPDATE folders SET name = ? WHERE id = ?`, name, id)
+	if err != nil {
+		return fmt.Errorf("rename folder: %w", err)
+	}
+	return requireRowAffected(res, fmt.Sprintf("folder %s", id))
+}
+
+// deleteFolder removes a folder. Its chats are kept and become unfiled
+// through the ON DELETE SET NULL foreign key on chats.folder_id.
+func (db *database) deleteFolder(id string) error {
+	res, err := db.conn.Exec(`DELETE FROM folders WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete folder: %w", err)
+	}
+	return requireRowAffected(res, fmt.Sprintf("folder %s", id))
+}
+
+// setChatFolder moves a chat into a folder, or out of any folder when
+// folderID is empty.
+func (db *database) setChatFolder(chatID, folderID string) error {
+	res, err := db.conn.Exec(`UPDATE chats SET folder_id = NULLIF(?, '') WHERE id = ?`, folderID, chatID)
+	if err != nil {
+		if strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			return fmt.Errorf("%w: folder %s", not.Found, folderID)
+		}
+		return fmt.Errorf("set chat folder: %w", err)
+	}
+	return requireRowAffected(res, fmt.Sprintf("chat %s", chatID))
+}
+
+func requireRowAffected(res sql.Result, what string) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: %s", not.Found, what)
 	}
 	return nil
 }

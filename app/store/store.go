@@ -110,6 +110,17 @@ type Chat struct {
 	Title        string          `json:"title"`
 	CreatedAt    time.Time       `json:"created_at"`
 	BrowserState json.RawMessage `json:"browser_state,omitempty" ts_type:"BrowserStateData"`
+
+	// FolderID is the folder the chat is grouped under, or empty if unfiled.
+	// It is loaded with the chat but ignored by SetChat; use SetChatFolder.
+	FolderID string `json:"folder_id,omitempty"`
+}
+
+// Folder groups related chats in the sidebar.
+type Folder struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // NewChat creates a new Chat with the ID, with CreatedAt timestamp initialized
@@ -522,6 +533,58 @@ func (s *Store) DeleteChat(id string) error {
 	}
 
 	return nil
+}
+
+func (s *Store) Folders() ([]Folder, error) {
+	if err := s.ensureDB(); err != nil {
+		return nil, err
+	}
+
+	return s.db.getFolders()
+}
+
+func (s *Store) CreateFolder(name string) (*Folder, error) {
+	if err := s.ensureDB(); err != nil {
+		return nil, err
+	}
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("generate folder ID: %w", err)
+	}
+
+	f := Folder{ID: id.String(), Name: name, CreatedAt: time.Now()}
+	if err := s.db.createFolder(f); err != nil {
+		return nil, err
+	}
+
+	return &f, nil
+}
+
+func (s *Store) RenameFolder(id, name string) error {
+	if err := s.ensureDB(); err != nil {
+		return err
+	}
+
+	return s.db.renameFolder(id, name)
+}
+
+// DeleteFolder deletes a folder without deleting its chats, which become unfiled.
+func (s *Store) DeleteFolder(id string) error {
+	if err := s.ensureDB(); err != nil {
+		return err
+	}
+
+	return s.db.deleteFolder(id)
+}
+
+// SetChatFolder moves a chat into a folder, or out of any folder when folderID is empty.
+func (s *Store) SetChatFolder(chatID, folderID string) error {
+	if err := s.ensureDB(); err != nil {
+		return err
+	}
+
+	return s.db.setChatFolder(chatID, folderID)
 }
 
 func (s *Store) WindowSize() (int, int, error) {

@@ -598,3 +598,35 @@ func TestCodexDesktopUsedMigration(t *testing.T) {
 		t.Fatal("expected existing installs to start with no inferred ChatGPT intro acknowledgment")
 	}
 }
+
+func TestFoldersMigrationKeepsExistingChats(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "folders.db")
+	old := loadV2Schema(t, dbPath)
+	if _, err := old.conn.Exec(`INSERT INTO chats (id, title) VALUES ('existing', 'old chat')`); err != nil {
+		t.Fatalf("failed to seed chat: %v", err)
+	}
+	old.Close()
+
+	// Reopen through the normal startup path, which migrates the existing database
+	db, err := newDatabase(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open existing database: %v", err)
+	}
+	defer db.Close()
+
+	chats, err := db.getAllChats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chats) != 1 || chats[0].ID != "existing" || chats[0].FolderID != "" {
+		t.Fatalf("chats after migration = %+v, want the existing chat unfiled", chats)
+	}
+
+	folders, err := db.getFolders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folders) != 0 {
+		t.Fatalf("expected no folders after migration, got %+v", folders)
+	}
+}

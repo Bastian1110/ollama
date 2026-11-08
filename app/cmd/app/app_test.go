@@ -3,7 +3,9 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/ollama/ollama/app/store"
@@ -177,5 +179,34 @@ func TestRunInitialWindowsUIRoutesInteractiveLaunch(t *testing.T) {
 				t.Fatalf("initial UI path = %q, want %q", gotPath, tt.wantPath)
 			}
 		})
+	}
+}
+
+func TestContextMenuResultScript(t *testing.T) {
+	for _, label := range []string{
+		"Rename",
+		"Move to Bob's project",
+		`Move to "quoted" \ back`,
+		"Move to '); alert(1); ('",
+		"Move to line separator",
+	} {
+		script := contextMenuResultScript(label)
+
+		const prefix, suffix = "window.handleContextMenuResult(", ")"
+		if !strings.HasPrefix(script, prefix) || !strings.HasSuffix(script, suffix) {
+			t.Fatalf("script = %q, want a single handleContextMenuResult call", script)
+		}
+		arg := strings.TrimSuffix(strings.TrimPrefix(script, prefix), suffix)
+
+		var got string
+		if err := json.Unmarshal([]byte(arg), &got); err != nil {
+			t.Fatalf("argument %s for %q is not one string literal: %v", arg, label, err)
+		}
+		if got != label {
+			t.Errorf("decoded label = %q, want %q", got, label)
+		}
+		if strings.ContainsRune(arg, ' ') {
+			t.Errorf("argument %s contains a raw line separator", arg)
+		}
 	}
 }

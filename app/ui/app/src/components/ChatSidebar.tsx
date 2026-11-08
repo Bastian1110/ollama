@@ -5,13 +5,127 @@ import { useQueryClient } from "@tanstack/react-query";
 import { getChat } from "@/api";
 import { Link } from "@/components/ui/link";
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { ChatsResponse } from "@/gotypes";
+import { ChatInfo, ChatsResponse, FolderInfo } from "@/gotypes";
 import { AppNavigation } from "@/components/AppSidebar";
+import {
+  useCreateFolder,
+  useDeleteFolder,
+  useMoveChatToFolder,
+  useRenameFolder,
+} from "@/hooks/useFolders";
+import { buildChatMenu, groupChatsByFolder } from "@/lib/chatFolders";
+import { ChevronRightIcon, PlusIcon } from "@heroicons/react/20/solid";
 
 // there's a hidden debug feature to copy a chat's data to the clipboard by
 // holding shift and clicking this many times within this many seconds
 const DEBUG_SHIFT_CLICKS_REQUIRED = 5;
 const DEBUG_SHIFT_CLICK_WINDOW_MS = 7000; // 7 seconds
+
+const COLLAPSED_FOLDERS_KEY = "ollama.collapsedFolders";
+
+function loadCollapsedFolders(): Set<string> {
+  try {
+    const stored = JSON.parse(
+      localStorage.getItem(COLLAPSED_FOLDERS_KEY) ?? "[]",
+    );
+    return new Set(Array.isArray(stored) ? stored : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveCollapsedFolders(collapsed: Set<string>) {
+  try {
+    localStorage.setItem(COLLAPSED_FOLDERS_KEY, JSON.stringify([...collapsed]));
+  } catch {
+    // collapsed folders are a convenience; losing them is harmless
+  }
+}
+
+const chatLabel = (chat: ChatInfo) =>
+  chat.title || chat.userExcerpt || chat.createdAt.toLocaleString();
+
+interface InlineNameInputProps {
+  initialValue?: string;
+  placeholder?: string;
+  onCommit: (value: string) => void;
+  onCancel: () => void;
+}
+
+// InlineNameInput edits a name in place. Enter or clicking elsewhere commits,
+// Escape or committing a blank value cancels.
+function InlineNameInput({
+  initialValue = "",
+  placeholder,
+  onCommit,
+  onCancel,
+}: InlineNameInputProps) {
+  const [value, setValue] = useState(initialValue);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const finished = useRef(false);
+
+  const finish = useCallback(
+    (commit: boolean) => {
+      if (finished.current) return;
+      finished.current = true;
+      const trimmed = value.trim();
+      if (commit && trimmed) {
+        onCommit(trimmed);
+      } else {
+        onCancel();
+      }
+    },
+    [value, onCommit, onCancel],
+  );
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        inputRef.current &&
+        !inputRef.current.contains(event.target as Node)
+      ) {
+        finish(true);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [finish]);
+
+  return (
+    <div className="flex-1 flex items-center min-w-0 px-2 py-2 bg-neutral-100 text-black dark:bg-neutral-800 rounded-lg">
+      <span className="truncate font-sans text-sm w-full">
+        <input
+          ref={inputRef}
+          type="text"
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              finish(true);
+            } else if (e.key === "Escape") {
+              finish(false);
+            }
+          }}
+          className="bg-transparent border-0 focus:outline-none w-full dark:text-white"
+          style={{
+            font: "inherit",
+            lineHeight: "inherit",
+            padding: 0,
+            margin: 0,
+          }}
+        />
+      </span>
+    </div>
+  );
+}
+
 interface ChatSidebarProps {
   currentChatId?: string;
 }
@@ -21,9 +135,16 @@ export function ChatSidebar({ currentChatId }: ChatSidebarProps) {
   const queryClient = useQueryClient();
   const renameMutation = useRenameChat();
   const deleteMutation = useDeleteChat();
+  const createFolderMutation = useCreateFolder();
+  const renameFolderMutation = useRenameFolder();
+  const deleteFolderMutation = useDeleteFolder();
+  const moveChatMutation = useMoveChatToFolder();
   const [editingChatId, setEditingChatId] = useState<string | null>(null);
-  const [editValue, setEditValue] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [editingFolderId, setEditingFolderId] = useState<string | null>(null);
+  // set while naming a new folder; chatId is the chat to move into it, if any
+  const [newFolder, setNewFolder] = useState<{ chatId?: string } | null>(null);
+  const [collapsedFolders, setCollapsedFolders] =
+    useState<Set<string>>(loadCollapsedFolders);
   const [shiftClicks, setShiftClicks] = useState<Record<string, number[]>>({});
   const [copiedChatId, setCopiedChatId] = useState<string | null>(null);
 
@@ -38,74 +159,80 @@ export function ChatSidebar({ currentChatId }: ChatSidebarProps) {
     [queryClient],
   );
 
-  const startEditing = useCallback((chatId: string, currentTitle: string) => {
-    setEditingChatId(chatId);
-    setEditValue(currentTitle);
+  const cancelEditing = useCallback(() => {
+    setEditingChatId(null);
+    setEditingFolderId(null);
+    setNewFolder(null);
   }, []);
 
-  const saveRename = useCallback(async () => {
-    if (!editingChatId || !editValue.trim()) {
+  const saveRename = useCallback(
+    async (chatId: string, newTitle: string) => {
+      // Exit edit mode immediately to prevent flash
       setEditingChatId(null);
-      return;
-    }
 
-    const newTitle = editValue.trim();
-    const chatId = editingChatId;
+      // Optimistically update the cache
+      queryClient.setQueryData(
+        ["chats"],
+        (oldData: ChatsResponse | undefined) => {
+          if (!oldData?.chatInfos) return oldData;
+          return {
+            ...oldData,
+            chatInfos: oldData.chatInfos.map((chat) =>
+              chat.id === chatId ? { ...chat, title: newTitle } : chat,
+            ),
+          };
+        },
+      );
 
-    // Exit edit mode immediately to prevent flash
-    setEditingChatId(null);
-    setEditValue("");
-
-    // Optimistically update the cache
-    queryClient.setQueryData(
-      ["chats"],
-      (oldData: ChatsResponse | undefined) => {
-        if (!oldData?.chatInfos) return oldData;
-        return {
-          ...oldData,
-          chatInfos: oldData.chatInfos.map((chat) =>
-            chat.id === chatId ? { ...chat, title: newTitle } : chat,
-          ),
-        };
-      },
-    );
-
-    try {
-      await renameMutation.mutateAsync({
-        chatId: chatId,
-        title: newTitle,
-      });
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    } catch (error: unknown) {
-      // Revert optimistic update on error
-      queryClient.invalidateQueries({ queryKey: ["chats"] });
-    }
-  }, [editingChatId, editValue, renameMutation, queryClient]);
-
-  useEffect(() => {
-    if (editingChatId && inputRef.current) {
-      inputRef.current.focus();
-      inputRef.current.select();
-    }
-  }, [editingChatId]);
-
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (
-        inputRef.current &&
-        !inputRef.current.contains(event.target as Node)
-      ) {
-        saveRename();
+      try {
+        await renameMutation.mutateAsync({
+          chatId: chatId,
+          title: newTitle,
+        });
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      } catch (error: unknown) {
+        // Revert optimistic update on error
+        queryClient.invalidateQueries({ queryKey: ["chats"] });
       }
-    };
+    },
+    [renameMutation, queryClient],
+  );
 
-    if (editingChatId) {
-      document.addEventListener("mousedown", handleClickOutside);
-      return () => {
-        document.removeEventListener("mousedown", handleClickOutside);
-      };
-    }
-  }, [editingChatId, editValue, saveRename]);
+  const saveFolderRename = useCallback(
+    (folderId: string, name: string) => {
+      setEditingFolderId(null);
+      renameFolderMutation.mutate({ folderId, name });
+    },
+    [renameFolderMutation],
+  );
+
+  const saveNewFolder = useCallback(
+    async (name: string) => {
+      const chatId = newFolder?.chatId;
+      setNewFolder(null);
+      try {
+        const folder = await createFolderMutation.mutateAsync(name);
+        if (chatId) {
+          await moveChatMutation.mutateAsync({ chatId, folderId: folder.id });
+        }
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      } catch (error: unknown) {
+        // already logged by the mutation
+      }
+    },
+    [newFolder, createFolderMutation, moveChatMutation],
+  );
+
+  const toggleFolder = useCallback((folderId: string) => {
+    setCollapsedFolders((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(folderId)) {
+        next.add(folderId);
+      }
+      saveCollapsedFolders(next);
+      return next;
+    });
+  }, []);
 
   const sortedChats = useMemo(() => {
     if (!data?.chatInfos) return [];
@@ -117,6 +244,11 @@ export function ChatSidebar({ currentChatId }: ChatSidebarProps) {
       return comparison;
     });
   }, [data?.chatInfos]);
+
+  const { folderGroups, unfiled } = useMemo(
+    () => groupChatsByFolder(sortedChats, data?.folders ?? []),
+    [sortedChats, data?.folders],
+  );
 
   const isToday = (date: Date) => {
     const today = new Date();
@@ -136,12 +268,12 @@ export function ChatSidebar({ currentChatId }: ChatSidebarProps) {
   // Group chats by time period
   const groupedChats = useMemo(() => {
     const groups = {
-      today: [] as typeof sortedChats,
-      thisWeek: [] as typeof sortedChats,
-      older: [] as typeof sortedChats,
+      today: [] as typeof unfiled,
+      thisWeek: [] as typeof unfiled,
+      older: [] as typeof unfiled,
     };
 
-    sortedChats.forEach((chat) => {
+    unfiled.forEach((chat) => {
       if (isToday(chat.updatedAt)) {
         groups.today.push(chat);
       } else if (isThisWeek(chat.updatedAt)) {
@@ -152,7 +284,7 @@ export function ChatSidebar({ currentChatId }: ChatSidebarProps) {
     });
 
     return groups;
-  }, [sortedChats]);
+  }, [unfiled]);
 
   const chatGroups = useMemo(() => {
     return [
@@ -223,20 +355,100 @@ export function ChatSidebar({ currentChatId }: ChatSidebarProps) {
   );
 
   const handleContextMenu = useCallback(
-    async (_: React.MouseEvent, chatId: string, chatTitle: string) => {
-      const selectedAction = await window.menu([
+    async (chat: ChatInfo) => {
+      const { items, actions } = buildChatMenu(
+        data?.folders ?? [],
+        chat.folderId,
+      );
+      const selected = await window.menu(items);
+      const action = selected ? actions.get(selected) : undefined;
+
+      switch (action?.type) {
+        case "rename":
+          cancelEditing();
+          setEditingChatId(chat.id);
+          break;
+        case "delete":
+          handleDeleteChat(chat.id);
+          break;
+        case "newFolder":
+          cancelEditing();
+          setNewFolder({ chatId: chat.id });
+          break;
+        case "move":
+          moveChatMutation.mutate({
+            chatId: chat.id,
+            folderId: action.folderId,
+          });
+          break;
+      }
+    },
+    [data?.folders, cancelEditing, handleDeleteChat, moveChatMutation],
+  );
+
+  const handleFolderContextMenu = useCallback(
+    async (folder: FolderInfo, chatCount: number) => {
+      const selected = await window.menu([
         { label: "Rename", enabled: true },
         { label: "Delete", enabled: true },
       ]);
 
-      if (selectedAction === "Rename") {
-        startEditing(chatId, chatTitle);
-      } else if (selectedAction === "Delete") {
-        handleDeleteChat(chatId);
+      if (selected === "Rename") {
+        cancelEditing();
+        setEditingFolderId(folder.id);
+      } else if (selected === "Delete") {
+        const confirmed = window.confirm(
+          chatCount > 0
+            ? `Delete the folder "${folder.name}"? Its ${chatCount === 1 ? "chat" : `${chatCount} chats`} will be kept.`
+            : `Delete the folder "${folder.name}"?`,
+        );
+        if (confirmed) {
+          deleteFolderMutation.mutate(folder.id);
+        }
       }
     },
-    [startEditing, handleDeleteChat],
+    [cancelEditing, deleteFolderMutation],
   );
+
+  const renderChat = (chat: ChatInfo) => (
+    <div
+      key={chat.id}
+      className={`allow-context-menu flex items-center relative text-sm text-neutral-800 dark:text-neutral-400 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
+        chat.id === currentChatId
+          ? "bg-neutral-100 text-black dark:bg-neutral-800"
+          : ""
+      }`}
+      onMouseEnter={() => handleMouseEnter(chat.id)}
+      onContextMenu={() => handleContextMenu(chat)}
+    >
+      {editingChatId === chat.id ? (
+        <InlineNameInput
+          initialValue={chatLabel(chat)}
+          onCommit={(title) => saveRename(chat.id, title)}
+          onCancel={cancelEditing}
+        />
+      ) : (
+        <Link
+          to="/c/$chatId"
+          params={{ chatId: chat.id }}
+          className="flex-1 flex items-center min-w-0 px-2 py-2 select-none"
+          onClick={(e) => {
+            handleShiftClick(e, chat.id);
+          }}
+          draggable={false}
+        >
+          <span className="truncate font-sans text-sm">{chatLabel(chat)}</span>
+          {copiedChatId === chat.id && (
+            <span className="ml-2 text-xs text-green-600 dark:text-green-400">
+              Copied!
+            </span>
+          )}
+        </Link>
+      )}
+    </div>
+  );
+
+  const showFolders = folderGroups.length > 0 || newFolder !== null;
 
   return (
     <nav
@@ -253,81 +465,89 @@ export function ChatSidebar({ currentChatId }: ChatSidebarProps) {
           </div>
         ) : (
           <div className="flex flex-col gap-3 pt-4">
+            {showFolders && (
+              <div className="flex flex-col gap-0.5">
+                <div className="group flex items-center justify-between px-2 py-1">
+                  <h3 className="text-xs font-medium text-neutral-400 dark:text-neutral-500 select-none">
+                    Folders
+                  </h3>
+                  <button
+                    type="button"
+                    aria-label="New folder"
+                    title="New folder"
+                    onClick={() => {
+                      cancelEditing();
+                      setNewFolder({});
+                    }}
+                    className="rounded text-neutral-400 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-neutral-700 dark:hover:text-neutral-200"
+                  >
+                    <PlusIcon className="h-4 w-4" />
+                  </button>
+                </div>
+                {newFolder && (
+                  <div className="flex items-center text-sm">
+                    <InlineNameInput
+                      placeholder="Folder name"
+                      onCommit={saveNewFolder}
+                      onCancel={cancelEditing}
+                    />
+                  </div>
+                )}
+                {folderGroups.map(({ folder, chats }) => {
+                  const collapsed = collapsedFolders.has(folder.id);
+                  return (
+                    <div key={folder.id} className="flex flex-col gap-0.5">
+                      <div
+                        className="allow-context-menu flex items-center text-sm text-neutral-800 dark:text-neutral-400 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800"
+                        onContextMenu={() =>
+                          handleFolderContextMenu(folder, chats.length)
+                        }
+                      >
+                        {editingFolderId === folder.id ? (
+                          <InlineNameInput
+                            initialValue={folder.name}
+                            onCommit={(name) =>
+                              saveFolderRename(folder.id, name)
+                            }
+                            onCancel={cancelEditing}
+                          />
+                        ) : (
+                          <button
+                            type="button"
+                            aria-expanded={!collapsed}
+                            onClick={() => toggleFolder(folder.id)}
+                            className="flex-1 flex items-center gap-1.5 min-w-0 px-2 py-2 text-left select-none"
+                          >
+                            <ChevronRightIcon
+                              className={`h-4 w-4 shrink-0 text-neutral-400 transition-transform ${
+                                collapsed ? "" : "rotate-90"
+                              }`}
+                            />
+                            <span className="truncate font-sans text-sm">
+                              {folder.name}
+                            </span>
+                            <span className="ml-auto pl-2 text-xs text-neutral-400 dark:text-neutral-500">
+                              {chats.length}
+                            </span>
+                          </button>
+                        )}
+                      </div>
+                      {!collapsed && chats.length > 0 && (
+                        <div className="flex flex-col gap-0.5 pl-4">
+                          {chats.map(renderChat)}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             {chatGroups.map((group) => (
               <div key={group.name} className="flex flex-col gap-0.5">
                 <h3 className="text-xs font-medium text-neutral-400 dark:text-neutral-500 px-2 py-1 select-none">
                   {group.name}
                 </h3>
-                {group.chats.map((chat) => (
-                  <div
-                    key={chat.id}
-                    className={`allow-context-menu flex items-center relative text-sm text-neutral-800 dark:text-neutral-400 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 ${
-                      chat.id === currentChatId
-                        ? "bg-neutral-100 text-black dark:bg-neutral-800"
-                        : ""
-                    }`}
-                    onMouseEnter={() => handleMouseEnter(chat.id)}
-                    onContextMenu={(e) =>
-                      handleContextMenu(
-                        e,
-                        chat.id,
-                        chat.title ||
-                          chat.userExcerpt ||
-                          chat.createdAt.toLocaleString(),
-                      )
-                    }
-                  >
-                    {editingChatId === chat.id ? (
-                      <div className="flex-1 flex items-center min-w-0 px-2 py-2 bg-neutral-100 text-black dark:bg-neutral-800 rounded-lg">
-                        <span className="truncate font-sans text-sm w-full">
-                          <input
-                            ref={inputRef}
-                            type="text"
-                            value={editValue}
-                            onChange={(e) => setEditValue(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.preventDefault();
-                                saveRename();
-                              } else if (e.key === "Escape") {
-                                setEditingChatId(null);
-                                setEditValue("");
-                              }
-                            }}
-                            className="bg-transparent border-0 focus:outline-none w-full dark:text-white"
-                            style={{
-                              font: "inherit",
-                              lineHeight: "inherit",
-                              padding: 0,
-                              margin: 0,
-                            }}
-                          />
-                        </span>
-                      </div>
-                    ) : (
-                      <Link
-                        to="/c/$chatId"
-                        params={{ chatId: chat.id }}
-                        className="flex-1 flex items-center min-w-0 px-2 py-2 select-none"
-                        onClick={(e) => {
-                          handleShiftClick(e, chat.id);
-                        }}
-                        draggable={false}
-                      >
-                        <span className="truncate font-sans text-sm">
-                          {chat.title ||
-                            chat.userExcerpt ||
-                            chat.createdAt.toLocaleString()}
-                        </span>
-                        {copiedChatId === chat.id && (
-                          <span className="ml-2 text-xs text-green-600 dark:text-green-400">
-                            Copied!
-                          </span>
-                        )}
-                      </Link>
-                    )}
-                  </div>
-                ))}
+                {group.chats.map(renderChat)}
               </div>
             ))}
           </div>

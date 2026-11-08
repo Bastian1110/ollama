@@ -3,11 +3,13 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/ollama/ollama/app/types/not"
 	"github.com/ollama/ollama/cmd/config"
 	"github.com/ollama/ollama/internal/onboarding"
 )
@@ -478,4 +480,124 @@ func setupTestStore(t *testing.T) (*Store, func()) {
 	}
 
 	return s, cleanup
+}
+
+func TestFolders(t *testing.T) {
+	s := &Store{DBPath: filepath.Join(t.TempDir(), "db.sqlite")}
+	defer s.Close()
+
+	chat := NewChat("chat-1")
+	chat.Title = "project chat"
+	chat.Messages = append(chat.Messages, NewMessage("user", "hello", nil))
+	if err := s.SetChat(*chat); err != nil {
+		t.Fatal(err)
+	}
+
+	folder, err := s.CreateFolder("Project A")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	folderOf := func(t *testing.T) string {
+		t.Helper()
+		chats, err := s.Chats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(chats) != 1 {
+			t.Fatalf("expected 1 chat, got %d", len(chats))
+		}
+		return chats[0].FolderID
+	}
+
+	t.Run("move chat into folder", func(t *testing.T) {
+		if err := s.SetChatFolder(chat.ID, folder.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := folderOf(t); got != folder.ID {
+			t.Fatalf("FolderID = %q, want %q", got, folder.ID)
+		}
+		loaded, err := s.Chat(chat.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.FolderID != folder.ID {
+			t.Fatalf("Chat().FolderID = %q, want %q", loaded.FolderID, folder.ID)
+		}
+	})
+
+	t.Run("saving chat keeps folder", func(t *testing.T) {
+		// SetChat runs on every message; it must not drop the chat out of its folder
+		loaded, err := s.Chat(chat.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		loaded.FolderID = ""
+		loaded.Messages = append(loaded.Messages, NewMessage("assistant", "hi", nil))
+		if err := s.SetChat(*loaded); err != nil {
+			t.Fatal(err)
+		}
+		if got := folderOf(t); got != folder.ID {
+			t.Fatalf("FolderID = %q after SetChat, want %q", got, folder.ID)
+		}
+	})
+
+	t.Run("rename folder", func(t *testing.T) {
+		if err := s.RenameFolder(folder.ID, "Project B"); err != nil {
+			t.Fatal(err)
+		}
+		folders, err := s.Folders()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(folders) != 1 || folders[0].Name != "Project B" {
+			t.Fatalf("folders = %+v, want one named Project B", folders)
+		}
+	})
+
+	t.Run("missing ids are not found", func(t *testing.T) {
+		if err := s.SetChatFolder(chat.ID, "no-such-folder"); !errors.Is(err, not.Found) {
+			t.Errorf("SetChatFolder(missing folder) = %v, want not.Found", err)
+		}
+		if err := s.SetChatFolder("no-such-chat", folder.ID); !errors.Is(err, not.Found) {
+			t.Errorf("SetChatFolder(missing chat) = %v, want not.Found", err)
+		}
+		if err := s.RenameFolder("no-such-folder", "x"); !errors.Is(err, not.Found) {
+			t.Errorf("RenameFolder(missing) = %v, want not.Found", err)
+		}
+		if err := s.DeleteFolder("no-such-folder"); !errors.Is(err, not.Found) {
+			t.Errorf("DeleteFolder(missing) = %v, want not.Found", err)
+		}
+		if got := folderOf(t); got != folder.ID {
+			t.Fatalf("failed move changed FolderID to %q", got)
+		}
+	})
+
+	t.Run("remove chat from folder", func(t *testing.T) {
+		if err := s.SetChatFolder(chat.ID, ""); err != nil {
+			t.Fatal(err)
+		}
+		if got := folderOf(t); got != "" {
+			t.Fatalf("FolderID = %q, want empty", got)
+		}
+	})
+
+	t.Run("deleting folder keeps its chats", func(t *testing.T) {
+		if err := s.SetChatFolder(chat.ID, folder.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.DeleteFolder(folder.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := folderOf(t); got != "" {
+			t.Fatalf("FolderID = %q after folder deletion, want empty", got)
+		}
+		folders, err := s.Folders()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(folders) != 0 {
+			t.Fatalf("expected no folders, got %+v", folders)
+		}
+	})
 }

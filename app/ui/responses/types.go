@@ -13,12 +13,20 @@ type ChatInfo struct {
 	ID          string    `json:"id"`
 	Title       string    `json:"title"`
 	UserExcerpt string    `json:"userExcerpt"`
+	FolderID    string    `json:"folderId,omitempty"`
 	CreatedAt   time.Time `json:"createdAt" ts_type:"Date" ts_transform:"new Date(__VALUE__)"`
 	UpdatedAt   time.Time `json:"updatedAt" ts_type:"Date" ts_transform:"new Date(__VALUE__)"`
 }
 
+type FolderInfo struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt" ts_type:"Date" ts_transform:"new Date(__VALUE__)"`
+}
+
 type ChatsResponse struct {
-	ChatInfos []ChatInfo `json:"chatInfos"`
+	ChatInfos []ChatInfo   `json:"chatInfos"`
+	Folders   []FolderInfo `json:"folders"`
 }
 
 type ChatResponse struct {

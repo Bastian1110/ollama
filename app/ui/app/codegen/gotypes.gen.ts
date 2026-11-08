@@ -5,6 +5,7 @@ export class ChatInfo {
     id: string;
     title: string;
     userExcerpt: string;
+    folderId?: string;
     createdAt: Date;
     updatedAt: Date;
 
@@ -13,16 +14,31 @@ export class ChatInfo {
         this.id = source["id"];
         this.title = source["title"];
         this.userExcerpt = source["userExcerpt"];
+        this.folderId = source["folderId"];
         this.createdAt = new Date(source["createdAt"]);
         this.updatedAt = new Date(source["updatedAt"]);
     }
 }
+export class FolderInfo {
+    id: string;
+    name: string;
+    createdAt: Date;
+
+    constructor(source: any = {}) {
+        if ('string' === typeof source) source = JSON.parse(source);
+        this.id = source["id"];
+        this.name = source["name"];
+        this.createdAt = new Date(source["createdAt"]);
+    }
+}
 export class ChatsResponse {
     chatInfos: ChatInfo[];
+    folders: FolderInfo[];
 
     constructor(source: any = {}) {
         if ('string' === typeof source) source = JSON.parse(source);
         this.chatInfos = this.convertValues(source["chatInfos"], ChatInfo);
+        this.folders = this.convertValues(source["folders"], FolderInfo);
     }
 
 	convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -159,6 +175,7 @@ export class Chat {
     title: string;
     created_at: Time;
     browser_state?: BrowserStateData;
+    folder_id?: string;
 
     constructor(source: any = {}) {
         if ('string' === typeof source) source = JSON.parse(source);
@@ -167,6 +184,7 @@ export class Chat {
         this.title = source["title"];
         this.created_at = this.convertValues(source["created_at"], Time);
         this.browser_state = source["browser_state"];
+        this.folder_id = source["folder_id"];
     }
 
 	convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -418,6 +436,7 @@ export class Settings {
     OnboardingVersion: number;
     AutoUpdateEnabled: boolean;
     ClaudeDesktopUsed: boolean;
+    CodexDesktopUsed: boolean;
 
     constructor(source: any = {}) {
         if ('string' === typeof source) source = JSON.parse(source);
@@ -439,6 +458,7 @@ export class Settings {
         this.OnboardingVersion = source["OnboardingVersion"];
         this.AutoUpdateEnabled = source["AutoUpdateEnabled"];
         this.ClaudeDesktopUsed = source["ClaudeDesktopUsed"];
+        this.CodexDesktopUsed = source["CodexDesktopUsed"];
     }
 }
 export class SettingsResponse {

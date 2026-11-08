@@ -1303,3 +1303,98 @@ func TestSettingsPreservesConcurrentCodexDesktopAcknowledgment(t *testing.T) {
 		t.Error("settings response returned a stale acknowledgment")
 	}
 }
+
+func TestFolderEndpoints(t *testing.T) {
+	testStore := &store.Store{DBPath: filepath.Join(t.TempDir(), "db.sqlite")}
+	defer testStore.Close()
+
+	chat := store.NewChat("chat-1")
+	if err := testStore.SetChat(*chat); err != nil {
+		t.Fatal(err)
+	}
+
+	server := &Server{Store: testStore}
+
+	call := func(t *testing.T, handler func(http.ResponseWriter, *http.Request) error, method, target, id, body string) (*httptest.ResponseRecorder, error) {
+		t.Helper()
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		if id != "" {
+			req.SetPathValue("id", id)
+		}
+		rr := httptest.NewRecorder()
+		return rr, handler(rr, req)
+	}
+
+	listChats := func(t *testing.T) responses.ChatsResponse {
+		t.Helper()
+		rr, err := call(t, server.listChats, "GET", "/api/v1/chats", "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var res responses.ChatsResponse
+		if err := json.NewDecoder(rr.Body).Decode(&res); err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+
+	rr, err := call(t, server.createFolder, "POST", "/api/v1/folders", "", `{"name":"  Project A  "}`)
+	if err != nil {
+		t.Fatalf("createFolder() error = %v", err)
+	}
+	var folder responses.FolderInfo
+	if err := json.NewDecoder(rr.Body).Decode(&folder); err != nil {
+		t.Fatal(err)
+	}
+	if folder.ID == "" || folder.Name != "Project A" {
+		t.Fatalf("created folder = %+v, want trimmed name and an ID", folder)
+	}
+
+	if _, err := call(t, server.setChatFolder, "PUT", "/api/v1/chat/chat-1/folder", "chat-1", `{"folderId":"`+folder.ID+`"}`); err != nil {
+		t.Fatalf("setChatFolder() error = %v", err)
+	}
+
+	res := listChats(t)
+	if len(res.Folders) != 1 || res.Folders[0].ID != folder.ID {
+		t.Fatalf("listed folders = %+v, want the created folder", res.Folders)
+	}
+	if len(res.ChatInfos) != 1 || res.ChatInfos[0].FolderID != folder.ID {
+		t.Fatalf("listed chats = %+v, want chat-1 in the folder", res.ChatInfos)
+	}
+
+	if _, err := call(t, server.renameFolder, "PUT", "/api/v1/folder/x/rename", folder.ID, `{"name":"Renamed"}`); err != nil {
+		t.Fatalf("renameFolder() error = %v", err)
+	}
+	if got := listChats(t).Folders[0].Name; got != "Renamed" {
+		t.Fatalf("folder name = %q, want Renamed", got)
+	}
+
+	t.Run("blank name is rejected", func(t *testing.T) {
+		rr, err := call(t, server.createFolder, "POST", "/api/v1/folders", "", `{"name":"   "}`)
+		if err == nil || rr.Code != http.StatusBadRequest {
+			t.Fatalf("createFolder(blank) = %d, %v; want 400 error", rr.Code, err)
+		}
+	})
+
+	t.Run("unknown folder is not found", func(t *testing.T) {
+		rr, err := call(t, server.setChatFolder, "PUT", "/api/v1/chat/chat-1/folder", "chat-1", `{"folderId":"missing"}`)
+		if err == nil || rr.Code != http.StatusNotFound {
+			t.Fatalf("setChatFolder(missing) = %d, %v; want 404 error", rr.Code, err)
+		}
+		rr, err = call(t, server.deleteFolder, "DELETE", "/api/v1/folder/missing", "missing", "")
+		if err == nil || rr.Code != http.StatusNotFound {
+			t.Fatalf("deleteFolder(missing) = %d, %v; want 404 error", rr.Code, err)
+		}
+	})
+
+	if _, err := call(t, server.deleteFolder, "DELETE", "/api/v1/folder/x", folder.ID, ""); err != nil {
+		t.Fatalf("deleteFolder() error = %v", err)
+	}
+	res = listChats(t)
+	if len(res.Folders) != 0 {
+		t.Fatalf("folders after delete = %+v, want none", res.Folders)
+	}
+	if len(res.ChatInfos) != 1 || res.ChatInfos[0].FolderID != "" {
+		t.Fatalf("chats after folder delete = %+v, want chat-1 kept and unfiled", res.ChatInfos)
+	}
+}

@@ -4,6 +4,7 @@ import {
   ChatEvent,
   DownloadEvent,
   ErrorEvent,
+  FolderInfo,
   InferenceComputeResponse,
   ModelCapabilitiesResponse,
   Model,
@@ -476,6 +477,70 @@ export async function deleteChat(chatId: string): Promise<void> {
     const error = await response.text();
     throw new Error(error || "Failed to delete chat");
   }
+}
+
+async function sendJSON(
+  method: string,
+  path: string,
+  body: unknown,
+  failure: string,
+): Promise<Response> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(error || failure);
+  }
+  return response;
+}
+
+export async function createFolder(name: string): Promise<FolderInfo> {
+  const response = await sendJSON(
+    "POST",
+    "/api/v1/folders",
+    { name: name.trim() },
+    "Failed to create folder",
+  );
+  return new FolderInfo(await response.json());
+}
+
+export async function renameFolder(
+  folderId: string,
+  name: string,
+): Promise<void> {
+  await sendJSON(
+    "PUT",
+    `/api/v1/folder/${folderId}/rename`,
+    { name: name.trim() },
+    "Failed to rename folder",
+  );
+}
+
+export async function deleteFolder(folderId: string): Promise<void> {
+  await sendJSON(
+    "DELETE",
+    `/api/v1/folder/${folderId}`,
+    undefined,
+    "Failed to delete folder",
+  );
+}
+
+// moveChatToFolder files a chat under a folder, or unfiles it when folderId is empty.
+export async function moveChatToFolder(
+  chatId: string,
+  folderId: string,
+): Promise<void> {
+  await sendJSON(
+    "PUT",
+    `/api/v1/chat/${chatId}/folder`,
+    { folderId },
+    "Failed to move chat",
+  );
 }
 
 // Get upstream information for model staleness checking

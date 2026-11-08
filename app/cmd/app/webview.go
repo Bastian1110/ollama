@@ -549,5 +549,16 @@ func menu_get_items() unsafe.Pointer {
 
 //export menu_handle_selection
 func menu_handle_selection(item *C.char) {
-	wv.webview.Eval(fmt.Sprintf("window.handleContextMenuResult('%s')", C.GoString(item)))
+	wv.webview.Eval(contextMenuResultScript(C.GoString(item)))
+}
+
+// contextMenuResultScript returns the script reporting a context menu
+// selection to the page. Labels can include user text such as folder names, so
+// the label is encoded as a JSON string literal rather than spliced in raw.
+func contextMenuResultScript(label string) string {
+	encoded, err := json.Marshal(label)
+	if err != nil {
+		encoded = []byte(`""`)
+	}
+	return fmt.Sprintf("window.handleContextMenuResult(%s)", encoded)
 }

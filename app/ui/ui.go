@@ -289,6 +289,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("DELETE /api/v1/chat/{id}", handle(s.deleteChat))
 	mux.Handle("POST /api/v1/create-chat", handle(s.createChat))
 	mux.Handle("PUT /api/v1/chat/{id}/rename", handle(s.renameChat))
+	mux.Handle("PUT /api/v1/chat/{id}/folder", handle(s.setChatFolder))
+	mux.Handle("POST /api/v1/folders", handle(s.createFolder))
+	mux.Handle("PUT /api/v1/folder/{id}/rename", handle(s.renameFolder))
+	mux.Handle("DELETE /api/v1/folder/{id}", handle(s.deleteFolder))
 
 	mux.Handle("GET /api/v1/inference-compute", handle(s.getInferenceCompute))
 	mux.Handle("POST /api/v1/model/upstream", handle(s.modelUpstream))
@@ -531,8 +535,17 @@ func (s *Server) listChats(w http.ResponseWriter, r *http.Request) error {
 		chatInfos[i] = chatInfoFromChat(chat)
 	}
 
+	folders, err := s.Store.Folders()
+	if err != nil {
+		return fmt.Errorf("failed to load folders: %w", err)
+	}
+	folderInfos := make([]responses.FolderInfo, len(folders))
+	for i, f := range folders {
+		folderInfos[i] = folderInfoFromFolder(f)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(responses.ChatsResponse{ChatInfos: chatInfos})
+	json.NewEncoder(w).Encode(responses.ChatsResponse{ChatInfos: chatInfos, Folders: folderInfos})
 	return nil
 }
 
@@ -1417,6 +1430,104 @@ func (s *Server) renameChat(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+func (s *Server) setChatFolder(w http.ResponseWriter, r *http.Request) error {
+	cid := r.PathValue("id")
+	if cid == "" {
+		return fmt.Errorf("chat ID is required")
+	}
+
+	var req struct {
+		// FolderID is the destination folder, or empty to remove the chat from its folder
+		FolderID string `json:"folderId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return fmt.Errorf("invalid request body: %w", err)
+	}
+
+	if err := s.Store.SetChatFolder(cid, req.FolderID); err != nil {
+		if errors.Is(err, not.Found) {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		return fmt.Errorf("failed to move chat: %w", err)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	return nil
+}
+
+// decodeFolderName reads a folder name from the request body, rejecting blank names
+func decodeFolderName(w http.ResponseWriter, r *http.Request) (string, error) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return "", fmt.Errorf("invalid request body: %w", err)
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return "", fmt.Errorf("folder name is required")
+	}
+	return name, nil
+}
+
+func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) error {
+	name, err := decodeFolderName(w, r)
+	if err != nil {
+		return err
+	}
+
+	folder, err := s.Store.CreateFolder(name)
+	if err != nil {
+		return fmt.Errorf("failed to create folder: %w", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(folderInfoFromFolder(*folder))
+	return nil
+}
+
+func (s *Server) renameFolder(w http.ResponseWriter, r *http.Request) error {
+	id := r.PathValue("id")
+	if id == "" {
+		return fmt.Errorf("folder ID is required")
+	}
+
+	name, err := decodeFolderName(w, r)
+	if err != nil {
+		return err
+	}
+
+	if err := s.Store.RenameFolder(id, name); err != nil {
+		if errors.Is(err, not.Found) {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		return fmt.Errorf("failed to rename folder: %w", err)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	return nil
+}
+
+func (s *Server) deleteFolder(w http.ResponseWriter, r *http.Request) error {
+	id := r.PathValue("id")
+	if id == "" {
+		return fmt.Errorf("folder ID is required")
+	}
+
+	if err := s.Store.DeleteFolder(id); err != nil {
+		if errors.Is(err, not.Found) {
+			w.WriteHeader(http.StatusNotFound)
+		}
+		return fmt.Errorf("failed to delete folder: %w", err)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	return nil
+}
+
 func (s *Server) deleteChat(w http.ResponseWriter, r *http.Request) error {
 	cid := r.PathValue("id")
 	if cid == "" {
@@ -1516,8 +1627,17 @@ func chatInfoFromChat(chat store.Chat) responses.ChatInfo {
 		ID:          chat.ID,
 		Title:       chat.Title,
 		UserExcerpt: userExcerpt,
+		FolderID:    chat.FolderID,
 		CreatedAt:   chat.CreatedAt,
 		UpdatedAt:   updatedAt,
+	}
+}
+
+func folderInfoFromFolder(f store.Folder) responses.FolderInfo {
+	return responses.FolderInfo{
+		ID:        f.ID,
+		Name:      f.Name,
+		CreatedAt: f.CreatedAt,
 	}
 }
 
